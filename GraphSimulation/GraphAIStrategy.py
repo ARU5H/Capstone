@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 from GraphSimulation.GraphModel import TripartiteGraph
 
 from .Nodes import (
@@ -16,12 +18,8 @@ from .GraphStrategy import MatchingStrategy
 import torch.nn as nn
 
 from torch import (
-    cuda,
-
     Tensor,
     tensor,
-
-    device,
 
     cat,
     stack,
@@ -29,24 +27,79 @@ from torch import (
     zeros,
 )
 
-cuda_is_available = cuda.is_available()
-DEVICE = device('cuda' if cuda_is_available else 'cpu')
+from .utils import DEVICE, DTYPE
 
 from torch import save as torch_save
 from torch import load as torch_load
 
+from torch.distributions import Categorical
+
 # GraphAI Strategy Class
 
-class TimeSeriesStrategy(nn.Module, MatchingStrategy):
-    def __init__(self, 
-            state_dim= 32, hidden_dim= 16, embed_dim= 16, 
-            name= "TimeSeriesStrategy") -> None:
+class BaseAIStrategy(nn.Module, MatchingStrategy, ABC):
+    def __init__(self, name="BaseAIStrategy") -> None:
         super().__init__()
         self.name = name
+
+        self.actions = 0
+        self.action_map: tuple[int,...] = ()
+
+    @abstractmethod
+    def process_graph(self, graph: TripartiteGraph):
+        pass
+
+    @abstractmethod
+    def get_inode_scores(self, graph: TripartiteGraph, node: varNode) -> Tensor:
+        pass
+
+    # Default inference for Nodes
+    def select_inode_for_var(self, graph: TripartiteGraph, node: varNode):
+        scores = self.get_inode_scores(graph, node)
+        action = scores.softmax(dim=0).argmax()
+
+        if action == self.actions: return None
+        return graph.Inodes[self.action_map[action]]
+
+    def select_inode_for_L(self, graph: TripartiteGraph, lnode: LNode) -> INode | None:
+        return self.select_inode_for_var(graph, lnode)
+
+    def select_inode_for_R(self, graph: TripartiteGraph, rnode: RNode) -> INode | None:
+        return self.select_inode_for_var(graph, rnode)
+
+    # For RL Algorithms
+    def sample_action(self, scores: Tensor):
+        probs = scores.softmax(dim=0)
+        dist = Categorical(probs)
+        action = dist.sample()
+        return action.item(), dist.log_prob(action), dist.entropy()
+
+    def save(self, filepath=None):
+        if filepath is None: filepath = f"{self.name}.pth"
+
+        torch_save(self.state_dict(), filepath)
+        print(f"Model saved to {filepath}")
+
+    def load(self, filepath=None):
+        if filepath is None: filepath = f"{self.name}.pth"
+
+        if path.exists(filepath):
+            self.load_state_dict(torch_load(filepath))
+            print(f"Model loaded from {filepath}")
+        else:
+            print(f"Warning: No file found at {filepath}")
+
+class TimeSeriesStrategy(BaseAIStrategy):
+    def __init__(self, 
+            state_dim= 32, hidden_dim= 16, embed_dim= 16,
+            device= DEVICE,
+            name= "TimeSeriesStrategy") -> None:
+        super().__init__(name)
 
         self.state_dim = state_dim
         self.hidden_dim = hidden_dim
         self.embed_dim = embed_dim
+
+        self.device = device
 
         self.inode_embed_table: nn.Embedding | None = None
         self.global_state = nn.Parameter(zeros(self.state_dim))
@@ -70,9 +123,6 @@ class TimeSeriesStrategy(nn.Module, MatchingStrategy):
             nn.Linear(self.embed_dim, self.state_dim),
             nn.Sigmoid(),
         )
-
-        self.actions = 0
-        self.action_map: tuple[int,...] = ()
 
         self.wait_token = nn.Sequential(
             nn.Linear(self.embed_dim, self.hidden_dim),
@@ -100,7 +150,7 @@ class TimeSeriesStrategy(nn.Module, MatchingStrategy):
 
         # Register embedding module
         self.inode_embed_table = nn.Embedding(self.actions, self.embed_dim)
-        self.add_module("inode_embed_table", self.inode_embed_table)
+        self.inode_embed_table.to(self.device)
 
         for idx, inode in enumerate(graph.Inodes.values()):
             inode.rank = RND_GEN.random()
@@ -115,7 +165,7 @@ class TimeSeriesStrategy(nn.Module, MatchingStrategy):
             float(inode.rank),
             float(left_count),
             float(right_count),
-        ])
+        ], device= self.device)
 
         return self.edge_encoder(inode_feat)
 
@@ -143,7 +193,7 @@ class TimeSeriesStrategy(nn.Module, MatchingStrategy):
         graph.embedding = (self.state_mask(h_t) * graph.embedding + self.embed_to_state(h_t)).detach()
         return edge_t, h_t
 
-    def select_inode_for_var(self, graph: TripartiteGraph, node: varNode):
+    def get_inode_scores(self, graph: TripartiteGraph, node: varNode):
         edge_t, h_t = self.update_state(graph, node)
 
         # Combine local + global signal
@@ -170,34 +220,5 @@ class TimeSeriesStrategy(nn.Module, MatchingStrategy):
         inode_embeds = stack(inode_embeds)
 
         # Compute scores (dot product)
-        scores = (inode_embeds * query.unsqueeze(0)).sum(dim=1) + tensor(mask)
-
-        probs = scores.softmax(dim=0) 
-        action = probs.argmax().item()
-
-        if action == self.actions: return None
-        return graph.Inodes[self.action_map[action]]
-
-    def select_inode_for_L(self, graph: TripartiteGraph, lnode: LNode) -> INode | None:
-        return self.select_inode_for_var(graph, lnode)
-    
-    def select_inode_for_R(self, graph: TripartiteGraph, rnode: RNode) -> INode | None:
-        return self.select_inode_for_var(graph, rnode)
-    
-    def save(self, filepath=None):
-        # Use default name if no path is provided
-        if filepath is None:
-            filepath = f"{self.name}.pth"
-        torch_save(self.state_dict(), filepath)
-        print(f"Model saved to {filepath}")
-
-    def load(self, filepath=None):
-        # Use default name if no path is provided
-        if filepath is None:
-            filepath = f"{self.name}.pth"
-
-        if path.exists(filepath):
-            self.load_state_dict(torch_load(filepath))
-            print(f"Model loaded from {filepath}")
-        else:
-            print(f"Warning: No file found at {filepath}")
+        scores = (inode_embeds * query.unsqueeze(0)).sum(dim=1) + tensor(mask, device= query.device)
+        return scores
