@@ -6,7 +6,9 @@ from .Nodes import (
 
 from .GraphStrategy import (
     MatchingStrategy,
-    GreedyStrategy, RankStrategy
+    RandomStrategy,
+    GreedyStrategy, 
+    RankStrategy
 )
 
 from .GraphAIStrategy import (
@@ -22,6 +24,7 @@ __all__ = [
     "RNode",
 
     "MatchingStrategy",
+    "RandomStrategy",
     "GreedyStrategy", 
     "RankStrategy",
 
