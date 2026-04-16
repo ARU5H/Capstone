@@ -21,11 +21,12 @@ from torch import (
     Tensor,
     tensor,
 
-    no_grad,
+    set_grad_enabled,
 
     cat,
     stack,
 
+    full,
     zeros,
 )
 
@@ -53,20 +54,17 @@ class BaseAIStrategy(nn.Module, MatchingStrategy, ABC):
         self.action_map: tuple[int,...] = ()
 
     @abstractmethod
-    def process_graph(self, graph: TripartiteGraph):
+    def _get_inode_scores(self, graph: TripartiteGraph, node: varNode) -> Tensor:
         pass
 
     @abstractmethod
-    def get_inode_scores(self, graph: TripartiteGraph, node: varNode) -> Tensor:
+    def process_graph(self, graph: TripartiteGraph):
         pass
 
     # Default inference for Nodes
     def select_inode_for_var(self, graph: TripartiteGraph, node: varNode):
-        if(self.training):
-            scores = self.get_inode_scores(graph, node)
-        else:
-            with no_grad():
-                scores = self.get_inode_scores(graph, node)
+        with set_grad_enabled(self.training):
+            scores = self._get_inode_scores(graph, node)
                 
         action = scores.softmax(dim=0).argmax()
         if action == self.actions: return None
@@ -83,13 +81,13 @@ class BaseAIStrategy(nn.Module, MatchingStrategy, ABC):
         probs = scores.softmax(dim=0)
         dist = Categorical(probs)
         action = dist.sample()
-        return action.item(), dist.log_prob(action), dist.entropy()
+        return action, dist.log_prob(action), dist.entropy()
 
-    def save(self, filepath=None):
+    def save(self, filepath=None, verbose= True):
         if filepath is None: filepath = f"{SAVE_DIR}/{self.name}.pth"
 
         torch_save(self.state_dict(), filepath)
-        print(f"Model saved to {filepath}")
+        if(verbose): print(f"Model saved to {filepath}")
 
     def load(self, filepath=None):
         if filepath is None: filepath = f"{SAVE_DIR}/{self.name}.pth"
@@ -105,8 +103,8 @@ class SupervisedStrategy(BaseAIStrategy):
                 hidden_dim=16,
                 embed_dim=16,
                 device=DEVICE,
-                name="SupervisedStrategy", deterministic_partner=True):
-        super().__init__(name, deterministic_partner)
+                name="SupervisedStrategy"):
+        super().__init__(name, True)
 
         self.hidden_dim = hidden_dim
         self.embed_dim = embed_dim
@@ -114,10 +112,12 @@ class SupervisedStrategy(BaseAIStrategy):
         self.device = device
 
         self.inode_embed_table: nn.Embedding | None = None
+        self.action_embed: Tensor = None # type: ignore
+        self.base_mask: Tensor = None # type: ignore
 
         # Encode edge features
         self.edge_encoder = nn.Sequential(
-            nn.Linear(7, hidden_dim),
+            nn.Linear(3 + 4, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
 
@@ -147,6 +147,11 @@ class SupervisedStrategy(BaseAIStrategy):
             inode.rank = RND_GEN.random()
             inode.embedding = self.inode_embed_table.weight[idx]
 
+        inode_embeds = self.inode_embed_table.weight
+        self.action_embed = cat([inode_embeds, self.wait_token.unsqueeze(0)], dim=0)
+        
+        self.base_mask = full((self.actions + 1,), -float('inf'), device=self.device, requires_grad=False)
+
     def update_state(self, graph: TripartiteGraph, node: varNode):
         edge_feature = []
 
@@ -171,28 +176,27 @@ class SupervisedStrategy(BaseAIStrategy):
         node_embeddings = self.edge_encoder(edge_tensors).mean(dim= 0)
         return node_embeddings
 
-    def get_inode_scores(self, graph: TripartiteGraph, node: varNode):
+    def _get_inode_scores(self, graph: TripartiteGraph, node: varNode):
         node_embed = self.update_state(graph, node)
 
         # Build query
         query = self.query_net(node_embed)
 
         # Mask invalid actions
-        mask = []
+        mask = self.base_mask
+        mask.fill_(-float('inf'))
+        
         candidate_set = set(node.candidate_Inodes)
-
-        for inode_id in self.action_map:
+        for idx, inode_id in enumerate(self.action_map):
             inode = graph.Inodes[inode_id]
-            valid = inode.available and inode_id in candidate_set
-            mask.append(0.0 if valid else -float('inf'))
+            if inode.available and inode_id in candidate_set:
+                mask[idx] = 0.0
+        
+        # WAIT always valid
+        mask[self.actions] = 0.0
 
-        # Action embeddings
-        inode_embeds = self.inode_embed_table.weight # type: ignore
-        action_embeds = cat([inode_embeds, self.wait_token.unsqueeze(0)], dim=0)
-        mask.append(0.0)  # WAIT always valid
-
-        scores = (action_embeds * query.unsqueeze(0)).sum(dim=1)
-        scores = scores + tensor(mask, device=query.device)
+        scores = (self.action_embed * query.unsqueeze(0)).sum(dim=1)
+        scores = scores + mask
 
         return scores
 
@@ -202,8 +206,8 @@ class TimeSeriesStrategy(BaseAIStrategy):
             hidden_dim= 16, 
             embed_dim= 16,
             device= DEVICE,
-            name= "TimeSeriesStrategy", deterministic_partner=True) -> None:
-        super().__init__(name, deterministic_partner)
+            name= "TimeSeriesStrategy") -> None:
+        super().__init__(name, True)
 
         self.state_dim = state_dim
         self.hidden_dim = hidden_dim
@@ -298,7 +302,7 @@ class TimeSeriesStrategy(BaseAIStrategy):
         graph.embedding = (self.state_mask(h_t) * graph.embedding + self.embed_to_state(h_t)).detach()
         return edge_t, h_t
 
-    def get_inode_scores(self, graph: TripartiteGraph, node: varNode):
+    def _get_inode_scores(self, graph: TripartiteGraph, node: varNode):
         edge_t, h_t = self.update_state(graph, node)
 
         # Combine local + global signal

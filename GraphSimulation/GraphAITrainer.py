@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import matplotlib.pyplot as plt
-from numpy import exp, clip
+
+from numpy import (array, exp)
 
 from GraphSimulation.GraphModel import TripartiteGraph
 
@@ -41,8 +44,9 @@ class TripartiteGraphTrainer:
         criterion: nn.Module,
         device=DEVICE,
 
-        beta_decay= 0.5,
-        beta_threshold= 0.45,
+        beta_decay= 5e-2,
+        beta_threshold= 0.55,
+        beta_decay_func: Literal['linear', 'exponential']= 'linear',
     ):
         self.teacher = teacher
         self.student = student
@@ -59,12 +63,13 @@ class TripartiteGraphTrainer:
         self.optimizer = optimizer
         self.criterion = criterion
 
-        self.loss_data = ()
+        self.loss_data = {}
         self.device = device
 
-        self.beta = 1.0
+        self.beta = array(1.0)
         self.beta_decay = beta_decay
         self.beta_threshold = beta_threshold
+        self.beta_decay_func = beta_decay_func
 
     def _candidates_mapping(self, candidates, graph_inode_ids):
         inode_ids = [graph_inode_ids[candidate_id] for candidate_id in candidates]
@@ -83,10 +88,12 @@ class TripartiteGraphTrainer:
                     graph.match(partner, inode, node) # type: ignore
 
     def _dagger_policy(self, teacher_inode: INode|None, student_inode:INode|None, step):
-        use_teacher = (RND_GEN.random() < self.beta)
-
-        self.beta = (self.beta * exp(-self.beta_decay * step)).clip(self.beta_threshold)
-
+        if(self.beta_decay_func == 'linear'):
+            beta = (self.beta - self.beta_decay * step).clip(self.beta_threshold)
+        else:
+            beta = (self.beta * exp(-self.beta_decay * step)).clip(self.beta_threshold)
+        
+        use_teacher = (RND_GEN.random() < beta)
         if use_teacher:
             exec_inode_teacher = teacher_inode
             if teacher_inode:
@@ -126,7 +133,7 @@ class TripartiteGraphTrainer:
             teacher_inode = self.teacher.select_inode_for_R(self.teacher_graph, t_node)
 
         # ---- Student (prediction) ----
-        scores = self.student.get_inode_scores(self.student_graph, s_node).unsqueeze(0)
+        scores = self.student._get_inode_scores(self.student_graph, s_node).unsqueeze(0)
 
         # ---- Map teacher → student index (for loss only) ----
         if teacher_inode:
@@ -159,7 +166,7 @@ class TripartiteGraphTrainer:
     def train_supervised(self, node_order, epochs=10, accumulation_steps=10, 
                         save_model=False, save_dir=SAVE_DIR, verbose=True):
         os.makedirs(save_dir, exist_ok=True)
-        best_loss = float('inf')
+
         loss_data = []
         n = len(node_order)
 
@@ -199,22 +206,20 @@ class TripartiteGraphTrainer:
             if(verbose): pbar.write(f"Epoch {epoch + 1}: avg_loss: {avg_loss:.4f}")
             pbar.close()
 
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                if save_model:
-                    self.student.save(save_dir + f"/{self.student.name}_best.pth")
+            if save_model and (epoch % 20 == 0):
+                self.student.save(save_dir + f"/{self.student.name}_best.pth", verbose= verbose)
 
             self.teacher_graph.reset()
             self.student_graph.reset()
 
-        self.loss_data = tuple(loss_data)
+        self.loss_data[f"{self.teacher.name}->{self.student.name}"] = tuple(loss_data)
         self.student.save()
 
         print("Training done")
-        return loss_data
 
     def plot_graph(self):
-        plt.plot(self.loss_data, label=f"{self.student.name}")
+        for key in self.loss_data:
+            plt.plot(self.loss_data[key], label=key)
 
         plt.title("Loss Data")
         plt.xlabel("epoch")
