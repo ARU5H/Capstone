@@ -32,6 +32,9 @@ class Node(Entity):
     def __eq__(self, other):
         return isinstance(other, Node) and self.id == other.id
 
+    def __repr__(self):
+        return f"Node(type='{self.node_type}', id={self.id})"
+
 class varNode(Node):
     def __init__(self, online_time, candidate_Inodes: tuple[int, ...], node_type: NODE_TYPE) -> None:
         super().__init__(node_type)
@@ -82,7 +85,7 @@ class INode(Node):
 
     @property
     def available(self) -> bool:
-        return bool(self._available.value)
+        return self._available != self.INode_state.Offline
 
     def waiting(self):
         self._available = self.INode_state.Waiting

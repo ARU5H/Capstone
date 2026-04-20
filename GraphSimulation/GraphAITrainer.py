@@ -20,10 +20,13 @@ from .GraphAIStrategy import SAVE_DIR, BaseAIStrategy
 from torch import (
     cuda,
 
+    isnan,
+
     Tensor,
     tensor,
     as_tensor,
 
+    cat,
     stack,
     long,
 
@@ -42,12 +45,56 @@ from tqdm.auto import tqdm
 from abc import ABC, abstractmethod
 
 # Value Nets
-# TODO: For PPO / A2C
 class ValueNet(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, hidden_dim=64, embed_dim=32, device=DEVICE):
         super().__init__()
 
+        self.device = device
+
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+        self.inode_encoder = nn.Sequential(
+            nn.Linear(6, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+        self.global_proj = nn.Sequential(
+            nn.Linear(4, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU()
+        )
+
+        self.value_head = nn.Sequential(
+            nn.Linear(3 * embed_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, state):
+        edge = as_tensor(state['edge'], device=self.device, dtype=DTYPE)
+        inode = as_tensor(state['inode'], device=self.device, dtype=DTYPE)
+        global_f = as_tensor(state['global'], device=self.device, dtype=DTYPE)
+
+        edge_embed = self.edge_encoder(edge).mean(dim=0)
+        inode_embed = self.inode_encoder(inode).mean(dim=0)
+        global_embed = self.global_proj(global_f)
+
+        x = cat([edge_embed, inode_embed, global_embed], dim=0)
+
+        value = self.value_head(x)
+        return value.squeeze()
+
 # RL Policies
+DISCOUNT_FACTOR = 0.75
+
 class BaseRLPolicy(ABC):
     def __init__(self) -> None:
         super().__init__()
@@ -71,7 +118,7 @@ class BaseRLPolicy(ABC):
     
     def finish_episode(self, graph: TripartiteGraph):
         if len(self.rewards) > 0:
-            self.rewards[-1] += graph.matches
+            self.rewards[-1] += 0.5 * graph.matches
 
     def compute_reward(self, graph: TripartiteGraph, node: varNode, inode: INode|None) -> float:
         reward = 0.0
@@ -80,7 +127,7 @@ class BaseRLPolicy(ABC):
         if inode is None:
             # WAIT penalty if valid actions exist
             if any(graph.Inodes[i].available for i in node.candidate_Inodes):
-                reward -= 0.75
+                reward -= 1.5
             else:
                 reward += 0.5  # correct WAIT
             return reward
@@ -97,14 +144,12 @@ class BaseRLPolicy(ABC):
             reward += 1.0  # valid but not useful yet
 
         # ---- LOAD BALANCING ----
-        degree = len(graph.left_memory[inode.id]) + len(graph.right_memory[inode.id])
-        reward -= 0.05 * degree  # discourage overuse
-
+        reward -= 0.01 * abs(len(graph.left_memory[inode.id]) - len(graph.right_memory[inode.id]))
         return reward
 # ---------------- VanillaPolicy ---------------- #
 
 class VanillaPolicyGradient(BaseRLPolicy):
-    def __init__(self, gamma=0.99, entropy_beta=0.01, device=DEVICE):
+    def __init__(self, gamma= DISCOUNT_FACTOR, entropy_beta=0.01, device=DEVICE):
         super().__init__()
 
         self.gamma = gamma
@@ -134,7 +179,7 @@ class VanillaPolicyGradient(BaseRLPolicy):
 # ---------------- A2C ---------------- #
 
 class A2CPolicy(VanillaPolicyGradient):
-    def __init__(self, value_net: ValueNet, gamma=0.99, entropy_beta=0.01, value_beta=0.5, device=DEVICE):
+    def __init__(self, value_net: ValueNet, gamma= DISCOUNT_FACTOR, entropy_beta=0.01, value_beta=0.5, device=DEVICE):
         super().__init__(gamma, entropy_beta, device)
 
         self.value_beta = value_beta
@@ -169,7 +214,7 @@ class A2CPolicy(VanillaPolicyGradient):
 # ---------------- PPO ---------------- #
 
 class PPOPolicy(A2CPolicy):
-    def __init__(self, value_net: ValueNet, gamma=0.99, clip_eps=0.2, entropy_beta=0.01, value_beta=0.5, device=DEVICE):
+    def __init__(self, value_net: ValueNet, gamma= DISCOUNT_FACTOR, clip_eps=0.2, entropy_beta=0.01, value_beta=0.5, device=DEVICE):
         super().__init__(value_net, gamma, entropy_beta, value_beta, device)
 
         self.clip_eps = clip_eps
@@ -213,6 +258,7 @@ class TripartiteGraphTrainer:
         criterion: nn.Module,
         device=DEVICE,
 
+        beta = 1.0,
         beta_decay= 5e-2,
         beta_threshold= 0.6,
         beta_decay_func: Literal['linear', 'exponential']= 'linear',
@@ -234,9 +280,10 @@ class TripartiteGraphTrainer:
         self.criterion = criterion
 
         self.loss_data = {}
+        self.reward_data = {}
         self.device = device
 
-        self.beta = array(1.0)
+        self.beta = array(beta)
         self.beta_decay = beta_decay
         self.beta_threshold = beta_threshold
         self.beta_decay_func = beta_decay_func
@@ -246,6 +293,8 @@ class TripartiteGraphTrainer:
 
     def set_teacher(self, teacher:MatchingStrategy | BaseAIStrategy):
         self.teacher = teacher
+
+        if(isinstance(teacher, BaseAIStrategy)): teacher.eval()
 
         # graphs
         self.teacher_graph = TripartiteGraph(teacher, self.n_inodes)
@@ -271,11 +320,15 @@ class TripartiteGraphTrainer:
     def _apply_action(self, graph: TripartiteGraph, strategy: MatchingStrategy, node: varNode, inode: INode|None):
         if node.node_type == 'L':
             if inode:
+                inode.waiting()
+
                 partner = strategy.select_partner(graph, graph.right_memory[inode.id])
                 if partner:
                     graph.match(node, inode, partner) # type: ignore
         elif node.node_type == 'R':
             if inode:
+                inode.waiting()
+
                 partner = strategy.select_partner(graph, graph.left_memory[inode.id])
                 if partner:
                     graph.match(partner, inode, node) # type: ignore
@@ -323,32 +376,31 @@ class TripartiteGraphTrainer:
         teacher_scores = self.teacher._get_inode_scores(self.teacher_graph, t_node)
 
         if not isinstance(teacher_scores, Tensor):
-            teacher_scores[teacher_scores == 0.0] = -float('inf')
-            teacher_scores = tensor(teacher_scores, device=self.device)
+            teacher_scores = as_tensor(teacher_scores, device=self.device, dtype= DTYPE)
         else:
-            teacher_scores = teacher_scores.to(self.device)
+            teacher_scores = teacher_scores.to(self.device).to(DTYPE)
 
         teacher_scores = teacher_scores.unsqueeze(0).detach()
 
         # ---- Student scores ----
         student_scores = self.student._get_inode_scores(self.student_graph, s_node)
-        student_scores = student_scores.unsqueeze(0)
+        student_scores = student_scores.unsqueeze(0).to(DTYPE).to(self.device)
 
         # ---- Loss (distribution-based) ----
         loss = self.criterion(student_scores, teacher_scores)
 
         # ---- Deterministic actions (argmax) ----
-        teacher_idx = teacher_scores.argmax(dim=1)
-        student_idx = student_scores.detach().argmax(dim=1)
+        teacher_idx = int(teacher_scores.argmax(dim=1).item())
+        student_idx = int(student_scores.detach().argmax(dim=1).item())
 
         # ---- Map to inodes ----
-        teacher_inode = (None if teacher_idx == self.student.actions
-            else self.teacher_graph.Inodes[self.teacher_inode_ids[teacher_idx]]
-        )
+        teacher_inode = None
+        if teacher_idx != self.student.actions:
+            teacher_inode = self.teacher_graph.Inodes[self.teacher_inode_ids[teacher_idx]]
 
-        student_inode = (None if student_idx == self.student.actions
-            else self.student_graph.Inodes[self.student_inode_ids[student_idx]]
-        )
+        student_inode = None
+        if student_idx != self.student.actions:
+            student_inode = self.student_graph.Inodes[self.student_inode_ids[student_idx]]
 
         # ---- DAgger policy ----
         exec_inode_teacher, exec_inode_student = self._dagger_policy(teacher_inode, student_inode, epoch)
@@ -430,11 +482,11 @@ class TripartiteGraphTrainer:
             inode_id = self.student_inode_ids[action]
             chosen_inode = self.student_graph.Inodes[inode_id]
 
-        # ---- Apply action ----
-        self._apply_action(self.student_graph, self.student, s_node, chosen_inode)
-
         # ---- Compute reward ----
         reward = self.rl_policy.compute_reward(self.student_graph, s_node, chosen_inode)
+
+        # ---- Apply action ----
+        self._apply_action(self.student_graph, self.student, s_node, chosen_inode)
 
         # ---- Store trajectory ----
         self.rl_policy.store_step(log_prob, reward, entropy)
@@ -484,18 +536,30 @@ class TripartiteGraphTrainer:
 
             self.student_graph.reset()
 
-        self.loss_data[f"RL->{self.student.name}"] = tuple(reward_data)
+        self.reward_data[f"RL->{self.student.name}"] = tuple(reward_data)
         self.student.save()
 
         print("RL Training done")
 
     def plot_graph(self):
+        plt.figure(figsize=(12, 8))
+        plt.subplot(2, 1, 1)
         for key in self.loss_data:
             plt.plot(self.loss_data[key], label=key)
 
         plt.title("Loss Data")
         plt.xlabel("epoch")
         plt.ylabel("loss")
-
         plt.legend()
+
+        plt.subplot(2, 1, 2)
+        for key in self.reward_data:
+            plt.plot(self.reward_data[key], label=key)
+
+        plt.title("Reward Data")
+        plt.xlabel("epoch")
+        plt.ylabel("reward")
+        plt.legend()
+
+        plt.tight_layout()
         plt.show()

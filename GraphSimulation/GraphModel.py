@@ -65,6 +65,9 @@ class TripartiteGraph(Entity):
         inode = self.strategy.select_inode_for_L(self, lnode)
 
         if inode:
+            # At least a pair has been made
+            inode.waiting()
+
             partner = self.strategy.select_partner(self, self.right_memory[inode.id])
             if partner: 
                 self.match(lnode, inode, partner) # type: ignore
@@ -93,8 +96,6 @@ class TripartiteGraph(Entity):
         rnode.connected_Inode = inode
 
         inode.connection = (lnode, rnode)
-        inode.offline()
-
         self.matches += 1
 
         # remove memory for this inode
@@ -108,6 +109,7 @@ class TripartiteGraph(Entity):
             if(inode_id in self.right_memory):
                 self.right_memory[inode_id].discard(rnode)
 
+        inode.offline()
         #print("MATCH:", lnode, "→", inode, "→", rnode)
 
     def compute_competitive_ratio(self, opt):
@@ -126,7 +128,7 @@ class TripartiteGraph(Entity):
             inode.reset()
 
             self.left_memory[inode.id] = set()
-            self.right_memory[inode.id] = set() 
+            self.right_memory[inode.id] = set()
 
         # Reinitialize strategy-specific state
         self.strategy.reset(self)

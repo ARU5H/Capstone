@@ -12,7 +12,7 @@ from .Nodes import (
 
 import os.path as path
 
-from .utils import RND_GEN, DEVICE, DTYPE
+from .utils import RND_GEN, DEVICE, DTYPE, VALID_TKN, INVALID_TKN
 
 from .GraphStrategy import MatchingStrategy
 
@@ -168,7 +168,7 @@ class MLPStrategy(BaseAIStrategy):
         for idx, inode in enumerate(graph.Inodes.values()):
             inode.embedding = self.inode_embed_table.weight[idx]
         
-        self.base_mask = full((self.actions + 1,), -float('inf'), device=self.device, requires_grad=False)
+        self.base_mask = full((self.actions + 1,), INVALID_TKN, device=self.device, requires_grad=False)
 
     def update_state(self, graph: TripartiteGraph, node: varNode):
         graph_state = graph.get_state(node)
@@ -356,7 +356,7 @@ class CNNStrategy(BaseAIStrategy):
         for idx, inode in enumerate(graph.Inodes.values()):
             inode.embedding = self.inode_embed_table.weight[idx]
 
-        self.base_mask = full((self.actions + 1,), -float('inf'), device=self.device, requires_grad=False)
+        self.base_mask = full((self.actions + 1,), INVALID_TKN, device=self.device, requires_grad=False)
 
     def update_state(self, graph: TripartiteGraph, node: varNode):
         graph_state = graph.get_state(node)
@@ -460,7 +460,7 @@ class TimeSeriesStrategy(BaseAIStrategy):
         inode_embed = self.inode_embed_table.weight
         self.action_embed = cat([inode_embed, self.wait_token.unsqueeze(0)], dim=0)
 
-        self.base_mask = full((self.actions + 1,), -float('inf'), device=self.device, requires_grad=False)
+        self.base_mask = full((self.actions + 1,), INVALID_TKN, device=self.device, requires_grad=False)
 
     def update_state(self, graph: TripartiteGraph, node: varNode):
         graph_state = graph.get_state(node)
@@ -556,7 +556,7 @@ class TransformerStrategy(BaseAIStrategy):
         for idx, inode in enumerate(graph.Inodes.values()):
             inode.embedding = self.inode_embed_table.weight[idx]
 
-        self.base_mask = full((self.actions + 1,), -float('inf'), device=self.device, requires_grad=False)
+        self.base_mask = full((self.actions + 1,), INVALID_TKN, device=self.device, requires_grad=False)
 
     def update_state(self, graph: TripartiteGraph, node: varNode):
         graph_state = graph.get_state(node)
@@ -589,8 +589,8 @@ class TransformerStrategy(BaseAIStrategy):
             inode = graph.Inodes[inode_id]
             if inode.available and inode_id in candidate_set:
                 mask[idx] = 0.0
-
         mask[self.actions] = 0.0
 
         scores = (action_embed * query.unsqueeze(0)).sum(dim=1)
-        return scores + mask
+        scores = scores + mask
+        return scores

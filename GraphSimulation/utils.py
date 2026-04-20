@@ -9,6 +9,9 @@ from torch import (
 SEED = 42
 RND_GEN = numpy.random.default_rng(SEED)
 
+VALID_TKN = 1.0
+INVALID_TKN = -float('inf')
+
 LARGE_NUMBER = 1e9
 EPS = 1e-8
 

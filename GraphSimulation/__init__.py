@@ -7,7 +7,8 @@ from .GraphStrategy import (
     MatchingStrategy,
     RandomStrategy,
     GreedyStrategy, 
-    RankStrategy
+    RankStrategy,
+    MinDegreeStrategy,
 )
 
 from .GraphAIStrategy import (
@@ -40,6 +41,7 @@ __all__ = [
     "RandomStrategy",
     "GreedyStrategy", 
     "RankStrategy",
+    "MinDegreeStrategy",
 
     "ValueNet",
 
